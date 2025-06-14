@@ -1,10 +1,12 @@
 import Vapor
 
-// configures your application
 public func configure(_ app: Application) async throws {
-    // uncomment to serve files from /Public folder
-    // app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
+    // Set global body size limit to 100MB
+    app.routes.defaultMaxBodySize = "100mb"
 
-    // register routes
-    try routes(app)
+    // Serve files from Public/ directory (optional)
+    app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
+
+    // Register routes
+    try await routes(app)
 }
