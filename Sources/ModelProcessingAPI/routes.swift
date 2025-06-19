@@ -14,42 +14,18 @@ func routes(_ app: Application) async throws {
     let api = app.grouped("api")
     
     // Process model endpoint
-    api.post("process") { req -> EventLoopFuture<Response> in
-        let promise = req.eventLoop.makePromise(of: Response.self)
-        
-        Task {
-            let controller = await ModelProcessingController()
-            do {
-                let response = try await controller.processModel(req)
-                promise.succeed(response)
-            } catch {
-                promise.fail(error)
-            }
-        }
-        
-        return promise.futureResult
+    api.post("process") { req async throws -> Response in
+        let controller = await ModelProcessingController()
+        return try await controller.processModel(req)
     }
     
     // Progress endpoint
-    api.get("progress") { req -> EventLoopFuture<ProgressResponse> in
-        let promise = req.eventLoop.makePromise(of: ProgressResponse.self)
+    api.get("progress") { req async throws -> ProgressResponse in
+        let controller = await ModelProcessingController()
+        print(controller)
         
-        Task {
-            let controller = await ModelProcessingController()
-            do {
-                let progressResponse = try await controller.getProgress(req)
-                promise.succeed(progressResponse)
-            } catch {
-                let defaultResponse = ProgressResponse(
-                    statusMessage: "Error: \(error.localizedDescription)",
-                    progress: 0.0,
-                    processingStage: "Error",
-                    isProcessing: false
-                )
-                promise.succeed(defaultResponse)
-            }
-        }
-        
-        return promise.futureResult
+        let res =  try await controller.getProgress(req)
+        print(res)
+        return res
     }
 }
