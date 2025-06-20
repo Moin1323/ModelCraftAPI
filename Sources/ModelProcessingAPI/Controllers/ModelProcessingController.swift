@@ -62,6 +62,9 @@ final class ModelProcessingController {
     private let retentionPeriod: TimeInterval = 24 * 3600
 
     func processModel(_ req: Request) async throws -> Response {
+        let startTime = Date()
+        req.logger.debug("Starting processModel, time: 0s")
+
         let activeTasks = req.application.storage[ActiveTasksKey.self] ?? 0
         guard activeTasks < maxConcurrentTasks else {
             let error = APIError(message: "Server is busy, please try again later")
@@ -74,13 +77,16 @@ final class ModelProcessingController {
         let file: File
         do {
             file = try await getUploadedFile(req: req)
+            req.logger.debug("Got uploaded file, time: \(Date().timeIntervalSince(startTime))s")
         } catch {
+            req.logger.error("No file uploaded, error: \(error), time: \(Date().timeIntervalSince(startTime))s")
             let error = APIError(message: "No file uploaded or invalid field name")
             let data = try JSONEncoder().encode(error)
             return Response(status: .badRequest, body: .init(data: data))
         }
         
         guard file.data.readableBytes < maxFileSize else {
+            req.logger.error("File too large: \(file.data.readableBytes) bytes, time: \(Date().timeIntervalSince(startTime))s")
             let error = APIError(message: "Uploaded file exceeds 600MB limit")
             let data = try JSONEncoder().encode(error)
             return Response(status: .payloadTooLarge, body: .init(data: data))
@@ -96,22 +102,26 @@ final class ModelProcessingController {
             try fileManager.createDirectory(at: inputDir, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: publicModelsDir, withIntermediateDirectories: true)
+            req.logger.debug("Created directories, time: \(Date().timeIntervalSince(startTime))s")
         } catch {
-            req.logger.error("Failed to create directories: \(error)")
+            req.logger.error("Failed to create directories: \(error), time: \(Date().timeIntervalSince(startTime))s")
             let apiError = APIError(message: "Failed to create directories: \(error.localizedDescription)")
             let data = try JSONEncoder().encode(apiError)
             return Response(status: .internalServerError, body: .init(data: data))
         }
         
         let zipURL = inputDir.appendingPathComponent(file.filename.lowercased().hasSuffix(".zip") ? file.filename : "\(file.filename).zip")
+        let writeStart = Date()
         try await req.fileio.writeFile(file.data, at: zipURL.path)
-        req.logger.debug("Saved uploaded ZIP to: \(zipURL.path)")
+        req.logger.debug("Saved uploaded ZIP to: \(zipURL.path), write time: \(Date().timeIntervalSince(writeStart))s, total time: \(Date().timeIntervalSince(startTime))s")
         
         do {
             try extractZip(zipURL, to: inputDir, req: req)
+            req.logger.debug("Extracted ZIP, time: \(Date().timeIntervalSince(startTime))s")
             
             let state = ProcessingState(selectedFolderURL: inputDir)
             await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: state)
+            req.logger.debug("Initialized state, time: \(Date().timeIntervalSince(startTime))s")
 
             let tempOutputFileURL = outputDir.appendingPathComponent("output_model.usdz")
             let response = try await startProcessing(outputURL: tempOutputFileURL, req: req, state: state)
@@ -125,7 +135,7 @@ final class ModelProcessingController {
                     req.logger.error("Background cleanup failed: \(error)")
                 }
             }
-            req.logger.info("Returning response: \(response)")
+            req.logger.info("Returning response: \(response), time: \(Date().timeIntervalSince(startTime))s")
             let data = try JSONEncoder().encode(response)
             return Response(status: .ok, body: .init(data: data))
         } catch {
@@ -134,7 +144,7 @@ final class ModelProcessingController {
             } catch {
                 req.logger.error("Cleanup failed: \(error)")
             }
-            req.logger.error("Processing failed: \(error)")
+            req.logger.error("Processing failed: \(error), time: \(Date().timeIntervalSince(startTime))s")
             let errorMessage = error.localizedDescription.contains("Missing images folder") ? error.localizedDescription : "Processing failed: \(error.localizedDescription)"
             let apiError = APIError(message: errorMessage)
             let data = try JSONEncoder().encode(apiError)
@@ -155,74 +165,79 @@ final class ModelProcessingController {
     }
 
     private func getUploadedFile(req: Request) async throws -> File {
-        req.logger.debug("Trying to get uploaded file")
+        let startTime = Date()
+        req.logger.debug("Starting getUploadedFile, time: 0s")
         
         // Log raw request body for debugging
         if let bodyData = req.body.data {
-            let debugRawPath = "/tmp/uploaded_raw_body.bin"
+            let debugRawPath = "/tmp/uploaded_raw_body_\(UUID().uuidString).bin"
+            let writeStart = Date()
             do {
                 try await req.fileio.writeFile(bodyData, at: debugRawPath)
-                req.logger.debug("Saved raw request body to: \(debugRawPath), size: \(bodyData.readableBytes)")
+                req.logger.debug("Saved raw request body to: \(debugRawPath), size: \(bodyData.readableBytes), write time: \(Date().timeIntervalSince(writeStart))s, total time: \(Date().timeIntervalSince(startTime))s")
             } catch {
-                req.logger.error("Failed to save raw body: \(error)")
+                req.logger.error("Failed to save raw body: \(error), time: \(Date().timeIntervalSince(startTime))s")
             }
         }
         
         // Try multipart form-data with 'file' field
         if let formFile = try? req.content.decode(FileUpload.self) {
-            req.logger.debug("Got file from multipart form at 'file' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes)")
-            let debugPath = "/tmp/uploaded_multipart.zip"
+            req.logger.debug("Got file from multipart 'file' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes), time: \(Date().timeIntervalSince(startTime))s")
+            let debugPath = "/tmp/uploaded_multipart_\(UUID().uuidString).zip"
             do {
                 let data = Data(buffer: formFile.data)
+                let writeStart = Date()
                 try data.write(to: URL(fileURLWithPath: debugPath))
-                req.logger.debug("Saved multipart file to: \(debugPath)")
+                req.logger.debug("Saved multipart file to: \(debugPath), write time: \(Date().timeIntervalSince(writeStart))s, total time: \(Date().timeIntervalSince(startTime))s")
                 let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
                 let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Multipart ZIP contents: \(contents)")
+                req.logger.debug("Multipart ZIP contents: \(contents), time: \(Date().timeIntervalSince(startTime))s")
             } catch {
-                req.logger.error("Failed to save or read multipart debug file: \(error)")
+                req.logger.error("Failed to save or read multipart debug file: \(error), time: \(Date().timeIntervalSince(startTime))s")
             }
             return File(data: formFile.data, filename: formFile.filename)
         }
         // Try multipart form-data with 'data' field
         else if let formFile = try? req.content.decode(FileUpload.self) {
-            req.logger.debug("Got file from multipart form at 'data' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes)")
-            let debugPath = "/tmp/uploaded_multipart_data.zip"
+            req.logger.debug("Got file from multipart 'data' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes), time: \(Date().timeIntervalSince(startTime))s")
+            let debugPath = "/tmp/uploaded_multipart_data_\(UUID().uuidString).zip"
             do {
                 let data = Data(buffer: formFile.data)
+                let writeStart = Date()
                 try data.write(to: URL(fileURLWithPath: debugPath))
-                req.logger.debug("Saved multipart file to: \(debugPath)")
+                req.logger.debug("Saved multipart file to: \(debugPath), write time: \(Date().timeIntervalSince(writeStart))s, total time: \(Date().timeIntervalSince(startTime))s")
                 let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
                 let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Multipart ZIP contents: \(contents)")
+                req.logger.debug("Multipart ZIP contents: \(contents), time: \(Date().timeIntervalSince(startTime))s")
             } catch {
-                req.logger.error("Failed to save or read multipart debug file: \(error)")
+                req.logger.error("Failed to save or read multipart debug file: \(error), time: \(Date().timeIntervalSince(startTime))s")
             }
             return File(data: formFile.data, filename: formFile.filename)
         }
         // Try direct file upload
         else if let uploadedFile = try? req.content.decode(File.self) {
-            req.logger.debug("Got direct file upload, filename: \(uploadedFile.filename), size: \(uploadedFile.data.readableBytes)")
+            req.logger.debug("Got direct file upload, filename: \(uploadedFile.filename), size: \(uploadedFile.data.readableBytes), time: \(Date().timeIntervalSince(startTime))s")
             return uploadedFile
         }
         // Fallback to raw body
         else if let bodyData = req.body.data {
             let filename = req.headers.contentDisposition?.filename ?? req.headers.first(name: "filename") ?? "uploaded_file.zip"
-            req.logger.debug("Got file from raw body data, filename: \(filename), size: \(bodyData.readableBytes)")
-            let debugPath = "/tmp/uploaded_raw.zip"
+            req.logger.debug("Got file from raw body data, filename: \(filename), size: \(bodyData.readableBytes), time: \(Date().timeIntervalSince(startTime))s")
+            let debugPath = "/tmp/uploaded_raw_\(UUID().uuidString).zip"
             do {
+                let writeStart = Date()
                 try await req.fileio.writeFile(bodyData, at: debugPath)
-                req.logger.debug("Saved raw file to: \(debugPath)")
+                req.logger.debug("Saved raw file to: \(debugPath), write time: \(Date().timeIntervalSince(writeStart))s, total time: \(Date().timeIntervalSince(startTime))s")
                 let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
                 let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Raw ZIP contents: \(contents)")
+                req.logger.debug("Raw ZIP contents: \(contents), time: \(Date().timeIntervalSince(startTime))s")
             } catch {
-                req.logger.error("Failed to save or read raw debug file: \(error)")
+                req.logger.error("Failed to save or read raw debug file: \(error), time: \(Date().timeIntervalSince(startTime))s")
             }
             return File(data: bodyData, filename: filename)
         }
         
-        req.logger.error("Failed to get file from any method")
+        req.logger.error("Failed to get file from any method, time: \(Date().timeIntervalSince(startTime))s")
         throw APIError(message: "No file uploaded or invalid field name")
     }
     
