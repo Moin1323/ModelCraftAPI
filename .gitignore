@@ -9,5 +9,6 @@ db.sqlite
 .env
 .env.*
 !.env.example
-models/
-/models
+models/*
+!models/.gitkeep
+
