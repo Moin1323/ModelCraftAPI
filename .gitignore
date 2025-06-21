@@ -9,3 +9,5 @@ db.sqlite
 .env
 .env.*
 !.env.example
+models/
+/models
