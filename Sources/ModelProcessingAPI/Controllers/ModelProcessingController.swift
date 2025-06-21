@@ -90,28 +90,50 @@ final class ModelProcessingController {
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent("model_processing_\(UUID().uuidString)")
         let inputDir = tempDir.appendingPathComponent("input")
         let outputDir = tempDir.appendingPathComponent("output")
-        var publicModelsDir = URL(fileURLWithPath: "/tmp/models")
+        let publicModelsDir = URL(fileURLWithPath: "/tmp/models")
 
+        // Robust directory creation with verification
         do {
+            try fileManager.createDirectory(at: inputDir, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: publicModelsDir, withIntermediateDirectories: true)
-        } catch {
-            req.logger.error("Failed to create directories at \(publicModelsDir.path): \(error)")
-            // Try fallback location
-            let fallbackDir = URL(fileURLWithPath: "/tmp/models")
-            do {
-                try fileManager.createDirectory(at: fallbackDir, withIntermediateDirectories: true)
-                publicModelsDir = fallbackDir
-            } catch {
-                req.logger.error("Fallback directory creation failed: \(error)")
-                throw error
+            
+            // Verify directories were actually created
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: inputDir.path, isDirectory: &isDir), isDir.boolValue else {
+                throw APIError(message: "Failed to create input directory")
             }
+            guard fileManager.fileExists(atPath: outputDir.path, isDirectory: &isDir), isDir.boolValue else {
+                throw APIError(message: "Failed to create output directory")
+            }
+            guard fileManager.fileExists(atPath: publicModelsDir.path, isDirectory: &isDir), isDir.boolValue else {
+                throw APIError(message: "Failed to create models directory")
+            }
+            
+            req.logger.info("Successfully created all required directories")
+        } catch {
+            req.logger.error("Directory creation failed: \(error)")
+            let apiError = APIError(message: "Failed to create directories: \(error.localizedDescription)")
+            let data = try JSONEncoder().encode(apiError)
+            return Response(status: .internalServerError, body: .init(data: data))
         }
         
         let zipURL = inputDir.appendingPathComponent(file.filename.lowercased().hasSuffix(".zip") ? file.filename : "\(file.filename).zip")
-        try await req.fileio.writeFile(file.data, at: zipURL.path)
-        req.logger.debug("Saved uploaded ZIP to: \(zipURL.path)")
+        
+        // Ensure directory exists before writing file
+        if !fileManager.fileExists(atPath: inputDir.path) {
+            try fileManager.createDirectory(at: inputDir, withIntermediateDirectories: true)
+        }
         
         do {
+            try await req.fileio.writeFile(file.data, at: zipURL.path)
+            req.logger.debug("Saved uploaded ZIP to: \(zipURL.path)")
+            
+            // Verify file was written
+            guard fileManager.fileExists(atPath: zipURL.path) else {
+                throw APIError(message: "Failed to verify file write operation")
+            }
+            
             try extractZip(zipURL, to: inputDir, req: req)
             
             let state = ProcessingState(selectedFolderURL: inputDir)
@@ -120,6 +142,7 @@ final class ModelProcessingController {
             let tempOutputFileURL = outputDir.appendingPathComponent("output_model.usdz")
             let response = try await startProcessing(outputURL: tempOutputFileURL, req: req, state: state)
             
+            // Schedule cleanup of temp directory
             let tempDirPath = tempDir.path
             Task.detached { @Sendable in
                 do {
@@ -129,17 +152,29 @@ final class ModelProcessingController {
                     req.logger.error("Background cleanup failed: \(error)")
                 }
             }
-            req.logger.info("Returning response: \(response)")
+            
+            req.logger.info("Returning successful response")
             let data = try JSONEncoder().encode(response)
             return Response(status: .ok, body: .init(data: data))
         } catch {
+            // Cleanup on failure
             do {
                 try fileManager.removeItem(at: tempDir)
+                req.logger.info("Cleaned up temporary directory after failure")
             } catch {
                 req.logger.error("Cleanup failed: \(error)")
             }
-            req.logger.error("Processing failed: \(error)")
-            let errorMessage = error.localizedDescription.contains("Missing images folder") ? error.localizedDescription : "Processing failed: \(error.localizedDescription)"
+            
+            let errorMessage: String
+            if let apiError = error as? APIError {
+                errorMessage = apiError.message
+            } else {
+                errorMessage = error.localizedDescription.contains("Missing images folder") ?
+                    error.localizedDescription :
+                    "Processing failed: \(error.localizedDescription)"
+            }
+            
+            req.logger.error("Processing failed: \(errorMessage)")
             let apiError = APIError(message: errorMessage)
             let data = try JSONEncoder().encode(apiError)
             return Response(status: .internalServerError, body: .init(data: data))
@@ -159,144 +194,135 @@ final class ModelProcessingController {
     }
 
     private func getUploadedFile(req: Request) async throws -> File {
-        req.logger.debug("Trying to get uploaded file")
+        req.logger.debug("Attempting to retrieve uploaded file")
         
-        // Log raw request body for debugging
+        // Debug: Log raw request body
         if let bodyData = req.body.data {
-            let debugRawPath = "/tmp/uploaded_raw_body.bin"
+            let debugRawPath = "/tmp/upload_debug_\(UUID().uuidString).bin"
             do {
                 try await req.fileio.writeFile(bodyData, at: debugRawPath)
-                req.logger.debug("Saved raw request body to: \(debugRawPath), size: \(bodyData.readableBytes)")
+                req.logger.debug("Saved raw request body for debugging: \(debugRawPath), size: \(bodyData.readableBytes)")
             } catch {
-                req.logger.error("Failed to save raw body: \(error)")
+                req.logger.error("Failed to save raw body debug file: \(error)")
             }
         }
         
-        // Try multipart form-data with 'file' field
+        // Try multipart form with 'file' field first
         if let formFile = try? req.content.decode(FileUpload.self) {
-            req.logger.debug("Got file from multipart form at 'file' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes)")
-            let debugPath = "/tmp/uploaded_multipart.zip"
-            do {
-                let data = Data(buffer: formFile.data)
-                try data.write(to: URL(fileURLWithPath: debugPath))
-                req.logger.debug("Saved multipart file to: \(debugPath)")
-                let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
-                let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Multipart ZIP contents: \(contents)")
-            } catch {
-                req.logger.error("Failed to save or read multipart debug file: \(error)")
-            }
+            req.logger.debug("Found file in 'file' field: \(formFile.filename), size: \(formFile.data.readableBytes)")
             return File(data: formFile.data, filename: formFile.filename)
         }
-        // Try multipart form-data with 'data' field
+        // Then try 'data' field
         else if let formFile = try? req.content.decode(FileUpload.self) {
-            req.logger.debug("Got file from multipart form at 'data' field, filename: \(formFile.filename), size: \(formFile.data.readableBytes)")
-            let debugPath = "/tmp/uploaded_multipart_data.zip"
-            do {
-                let data = Data(buffer: formFile.data)
-                try data.write(to: URL(fileURLWithPath: debugPath))
-                req.logger.debug("Saved multipart file to: \(debugPath)")
-                let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
-                let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Multipart ZIP contents: \(contents)")
-            } catch {
-                req.logger.error("Failed to save or read multipart debug file: \(error)")
-            }
+            req.logger.debug("Found file in 'data' field: \(formFile.filename), size: \(formFile.data.readableBytes)")
             return File(data: formFile.data, filename: formFile.filename)
         }
-        // Try direct file upload
+        // Then try direct file upload
         else if let uploadedFile = try? req.content.decode(File.self) {
-            req.logger.debug("Got direct file upload, filename: \(uploadedFile.filename), size: \(uploadedFile.data.readableBytes)")
+            req.logger.debug("Found direct file upload: \(uploadedFile.filename), size: \(uploadedFile.data.readableBytes)")
             return uploadedFile
         }
-        // Fallback to raw body
+        // Finally fall back to raw body
         else if let bodyData = req.body.data {
-            let filename = req.headers.contentDisposition?.filename ?? req.headers.first(name: "filename") ?? "uploaded_file.zip"
-            req.logger.debug("Got file from raw body data, filename: \(filename), size: \(bodyData.readableBytes)")
-            let debugPath = "/tmp/uploaded_raw.zip"
-            do {
-                try await req.fileio.writeFile(bodyData, at: debugPath)
-                req.logger.debug("Saved raw file to: \(debugPath)")
-                let archive = try Archive(url: URL(fileURLWithPath: debugPath), accessMode: .read)
-                let contents = archive.map { $0.path }.joined(separator: ", ")
-                req.logger.debug("Raw ZIP contents: \(contents)")
-            } catch {
-                req.logger.error("Failed to save or read raw debug file: \(error)")
-            }
+            let filename = req.headers.contentDisposition?.filename ??
+                         req.headers.first(name: "filename") ??
+                         "upload_\(UUID().uuidString).zip"
+            
+            req.logger.debug("Using raw body as file: \(filename), size: \(bodyData.readableBytes)")
             return File(data: bodyData, filename: filename)
         }
         
-        req.logger.error("Failed to get file from any method")
-        throw APIError(message: "No file uploaded or invalid field name")
+        req.logger.error("Could not locate file in request")
+        throw APIError(message: "No file found in request. Please upload a file using 'file' or 'data' field, or as raw body.")
     }
     
     private func extractZip(_ zipURL: URL, to destination: URL, req: Request, depth: Int = 0) throws {
-        guard depth < 3 else { throw APIError(message: "Too many nested ZIP files") }
+        guard depth < 3 else {
+            throw APIError(message: "Maximum ZIP nesting depth (3) exceeded")
+        }
         
         let fileManager = FileManager.default
-        req.logger.notice("Extracting ZIP: \(zipURL.path) to \(destination.path)")
+        req.logger.notice("Extracting ZIP archive: \(zipURL.lastPathComponent)")
         
         do {
             let archive = try Archive(url: zipURL, accessMode: .read)
-            req.logger.debug("ZIP contents:")
+            
+            // Log contents for debugging
+            req.logger.debug("Archive contents:")
             for entry in archive {
                 req.logger.debug("- \(entry.path)")
             }
             
+            // Perform extraction
             try fileManager.unzipItem(at: zipURL, to: destination)
             
+            // Verify extraction
             let contents = try fileManager.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)
-            req.logger.notice("Extracted \(contents.count) items:")
-            for item in contents {
-                req.logger.debug("- \(item.lastPathComponent)")
-            }
+            req.logger.notice("Extracted \(contents.count) items")
             
-            // Check for nested ZIPs
-            for item in contents where item.pathExtension.lowercased() == "zip" && item.lastPathComponent != zipURL.lastPathComponent {
+            // Handle nested ZIPs
+            for item in contents where item.pathExtension.lowercased() == "zip" &&
+                                      item.lastPathComponent != zipURL.lastPathComponent {
+                req.logger.debug("Found nested ZIP: \(item.lastPathComponent)")
+                
                 let nestedDest = destination.appendingPathComponent(item.deletingPathExtension().lastPathComponent)
                 try fileManager.createDirectory(at: nestedDest, withIntermediateDirectories: true)
+                
+                // Recursively extract
                 try extractZip(item, to: nestedDest, req: req, depth: depth + 1)
+                
+                // Remove the nested ZIP after extraction
                 try fileManager.removeItem(at: item)
             }
         } catch {
             req.logger.error("ZIP extraction failed: \(error)")
-            throw APIError(message: "Failed to extract ZIP: \(error.localizedDescription)")
+            throw APIError(message: "Failed to extract ZIP archive: \(error.localizedDescription)")
         }
     }
 
     private func startProcessing(outputURL: URL, req: Request, state: ProcessingState) async throws -> ModelResponse {
         var state = state
         guard let folderURL = state.selectedFolderURL else {
-            throw APIError(message: "No folder selected")
+            throw APIError(message: "No input folder available for processing")
         }
 
+        // Update processing state
         state.isProcessing = true
         state.progress = 0.0
-        state.statusMessage = "Processing started"
+        state.statusMessage = "Initializing processing"
         state.processingStage = "Preparing data"
         await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: state)
 
+        // Check for PLY reference file
         let usePLYAsReference = try await shouldUsePLYReference(from: folderURL, req: req, state: &state)
+        
+        // Prepare input folder structure
         let (inputFolder, imagesFolder) = try prepareInputFolder(folderURL, usePLY: usePLYAsReference, req: req)
 
+        // Configure photogrammetry session
         var configuration = PhotogrammetrySession.Configuration()
         configuration.sampleOrdering = .sequential
         configuration.featureSensitivity = usePLYAsReference ? .high : .normal
         configuration.isObjectMaskingEnabled = false
 
+        // Create and start session
         let session = try PhotogrammetrySession(input: imagesFolder, configuration: configuration)
         state.photogrammetrySession = session
         await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: state)
 
+        // Setup timeout
         let timeoutTask = Task {
-            try await Task.sleep(nanoseconds: 1_200_000_000_000)
+            try await Task.sleep(nanoseconds: 1_200_000_000_000) // 20 minutes
             session.finish()
-            throw APIError(message: "Processing timed out after 1200 seconds")
+            throw APIError(message: "Processing timed out after 20 minutes")
         }
 
         do {
+            // Start processing
             try session.process(requests: [.modelFile(url: outputURL, detail: optimalDetailLevel)])
             var response: ModelResponse?
+            
+            // Process outputs
             for try await output in session.outputs {
                 let (updatedState, resp) = try await handleSessionOutput(
                     output,
@@ -312,13 +338,18 @@ final class ModelProcessingController {
                 }
                 await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: state)
             }
+            
+            // Cleanup
             timeoutTask.cancel()
             session.finish()
+            
             guard let response = response else {
-                throw APIError(message: "Failed to generate response")
+                throw APIError(message: "Processing completed but no model was generated")
             }
+            
             return response
         } catch {
+            // Error handling
             timeoutTask.cancel()
             session.finish()
             try await cleanup(tempFolder: inputFolder, logger: req.logger, req: req)
@@ -346,13 +377,19 @@ final class ModelProcessingController {
         case .requestComplete(_, let result):
             if case .modelFile(url: let url) = result {
                 do {
+                    // Move the generated file to output location
                     try FileManager.default.moveItem(at: url, to: outputURL)
-                    let publicModelsDir = URL(fileURLWithPath: req.application.directory.publicDirectory).appendingPathComponent("models")
-                    let outputFileName = "output_\(UUID().uuidString).usdz"
+                    
+                    // Prepare final output location
+                    let publicModelsDir = URL(fileURLWithPath: "/tmp/models")
+                    let outputFileName = "model_\(UUID().uuidString).usdz"
                     let finalOutputFileURL = publicModelsDir.appendingPathComponent(outputFileName)
+                    
+                    // Move to public directory
                     try FileManager.default.moveItem(at: outputURL, to: finalOutputFileURL)
-                    req.logger.info("Saved USDZ model to: \(finalOutputFileURL.path)")
-
+                    req.logger.info("Model saved to: \(finalOutputFileURL.path)")
+                    
+                    // Generate response
                     let modelUrl = "\(baseUrl)/models/\(outputFileName)"
                     let expirationDate = Date().addingTimeInterval(retentionPeriod)
                     let dateFormatter = ISO8601DateFormatter()
@@ -361,15 +398,15 @@ final class ModelProcessingController {
 
                     response = ModelResponse(
                         modelUrl: modelUrl,
-                        statusMessage: "Model processed and saved successfully",
+                        statusMessage: "Model processed successfully",
                         expiresAt: expiresAt
                     )
-                    req.logger.info("Returning response: \(response.map { "\($0.modelUrl), \($0.statusMessage)" } ?? "nil")")
+                    
                     newState.statusMessage = "Model saved"
                     newState.isProcessing = false
                 } catch {
-                    req.logger.error("File move failed: \(error)")
-                    newState.statusMessage = "Error: Failed to save model"
+                    req.logger.error("File operation failed: \(error)")
+                    newState.statusMessage = "Error saving model"
                     newState.isProcessing = false
                     throw APIError(message: "Failed to save model: \(error.localizedDescription)")
                 }
@@ -381,7 +418,12 @@ final class ModelProcessingController {
             req.logger.error("Processing error: \(error.localizedDescription)")
 
         case .invalidSample(let id, let reason):
-            req.logger.warning("Invalid sample ID \(id): \(reason)")
+            req.logger.warning("Invalid sample (ID: \(id)): \(reason)")
+
+        case .processingCancelled:
+            newState.statusMessage = "Processing cancelled"
+            newState.isProcessing = false
+            req.logger.warning("Processing was cancelled")
 
         default:
             break
@@ -402,12 +444,15 @@ final class ModelProcessingController {
         
         if state.processingStage != newStage {
             state.processingStage = newStage
+            req.logger.info("Progress update: \(newStage) (\(Int(progress * 100))%)")
         }
     }
 
     private func cleanup(tempFolder: URL, logger: Logger, req: Request) async throws {
         do {
             try FileManager.default.removeItem(at: tempFolder)
+            logger.info("Cleaned up temporary folder: \(tempFolder.path)")
+            
             if var state = req.storage[ProcessingStateKey.self] {
                 state.isProcessing = false
                 state.photogrammetrySession = nil
@@ -415,7 +460,7 @@ final class ModelProcessingController {
             }
         } catch {
             logger.error("Cleanup failed: \(error)")
-            throw APIError(message: "Cleanup failed: \(error.localizedDescription)")
+            throw APIError(message: "Failed to clean up temporary files: \(error.localizedDescription)")
         }
     }
 
@@ -423,6 +468,7 @@ final class ModelProcessingController {
         guard let plyURL = getPLYFile(from: folderURL, req: req) else {
             return false
         }
+        
         do {
             let result = try validatePLYFile(plyURL, state: &state, req: req)
             await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: state)
@@ -435,21 +481,26 @@ final class ModelProcessingController {
     private func prepareInputFolder(_ folderURL: URL, usePLY: Bool, req: Request) throws -> (tempFolder: URL, imagesFolder: URL) {
         let tempFolder = FileManager.default.temporaryDirectory
             .appendingPathComponent("photogrammetry_input_\(UUID().uuidString)")
+        
         try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+        req.logger.debug("Created temporary input folder: \(tempFolder.path)")
 
         guard let imagesFolder = getImagesFolder(from: folderURL, req: req) else {
-            throw APIError(message: "Missing images folder. Ensure the ZIP contains an 'images' folder with at least 10 JPEG images and corresponding pose files.")
+            throw APIError(message: "No valid images folder found. Ensure your ZIP contains an 'images' folder with at least 10 JPEG images and corresponding pose files.")
         }
 
+        // Process images with pose data
         let processedImages = try processImagesWithPoses(from: imagesFolder, req: req)
         let imagesDestFolder = tempFolder.appendingPathComponent("images")
         try FileManager.default.createDirectory(at: imagesDestFolder, withIntermediateDirectories: true)
         try FileManager.default.copyContentsOfDirectory(at: processedImages, to: imagesDestFolder)
 
+        // Handle PLY reference file if available
         if usePLY, let plyFile = getPLYFile(from: folderURL, req: req) {
             let plyDest = tempFolder.appendingPathComponent("model.ply")
             try FileManager.default.copyItem(at: plyFile, to: plyDest)
             try createPLYMetadataFile(in: tempFolder, req: req)
+            req.logger.info("Using PLY reference file for processing")
         }
 
         return (tempFolder, imagesFolder)
@@ -474,6 +525,7 @@ final class ModelProcessingController {
             let poseURL = folderURL.appendingPathComponent("\(baseName)_pose.json")
             
             guard FileManager.default.fileExists(atPath: poseURL.path) else {
+                req.logger.debug("No pose file for image: \(imageURL.lastPathComponent)")
                 continue
             }
             
@@ -481,6 +533,7 @@ final class ModelProcessingController {
                 let poseData = try Data(contentsOf: poseURL)
                 let poseJson = try JSONSerialization.jsonObject(with: poseData) as? [String: Any]
                 
+                // Quality checks
                 if let confidence = poseJson?["confidence"] as? Double, confidence < minPoseConfidence {
                     skippedDueToQuality += 1
                     continue
@@ -494,48 +547,54 @@ final class ModelProcessingController {
                     continue
                 }
                 
+                // Process valid image
                 let poseMatrix = try validatePoseJSON(poseData, req: req)
                 let transform = convertToSIMDMatrix(poseMatrix, req: req)
                 let outputURL = tempFolder.appendingPathComponent(imageURL.lastPathComponent)
                 try embedPoseData(in: imageURL, to: outputURL, with: transform, poseJson: poseJson, req: req)
                 processedCount += 1
             } catch {
+                req.logger.debug("Skipping image due to error: \(error.localizedDescription)")
                 continue
             }
         }
         
         guard processedCount >= 10 else {
             throw APIError(message: """
-                Need at least 10 valid images (found \(processedCount)). 
-                \(skippedDueToQuality > 0 ? "\(skippedDueToQuality) were skipped due to low quality." : "")
+                Insufficient valid images (found \(processedCount), need at least 10). 
+                \(skippedDueToQuality > 0 ? "\(skippedDueToQuality) images were skipped due to low quality." : "")
                 """)
         }
         
+        req.logger.info("Processed \(processedCount) valid images with pose data")
         return tempFolder
     }
 
     private func validatePoseJSON(_ data: Data, req: Request) throws -> [[Double]] {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let matrix = json["transform"] as? [[Double]] else {
-            throw APIError(message: "Missing or invalid transform matrix")
+            throw APIError(message: "Invalid pose data: missing or malformed transform matrix")
         }
         
+        // Validate matrix structure
         guard matrix.count == 4, matrix.allSatisfy({ $0.count == 4 }) else {
-            throw APIError(message: "Matrix must be 4x4")
+            throw APIError(message: "Invalid transform matrix: must be 4x4")
         }
         
+        // Validate numerical values
         for row in matrix {
             for value in row {
                 if value.isNaN || value.isInfinite {
-                    throw APIError(message: "Matrix contains invalid numbers")
+                    throw APIError(message: "Transform matrix contains invalid numbers")
                 }
             }
         }
         
+        // Check for degenerate matrix
         let simdMatrix = convertToSIMDMatrix(matrix, req: req)
         let determinant = abs(simdMatrix.determinant)
         guard determinant > 1e-6 else {
-            throw APIError(message: "Degenerate transform matrix")
+            throw APIError(message: "Degenerate transform matrix (near-zero determinant)")
         }
         
         return matrix
@@ -543,10 +602,12 @@ final class ModelProcessingController {
 
     private func embedPoseData(in sourceURL: URL, to destinationURL: URL, with transform: simd_float4x4, poseJson: [String: Any]?, req: Request) throws {
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil) else {
-            throw APIError(message: "Failed to create image source")
+            throw APIError(message: "Failed to create image source for \(sourceURL.lastPathComponent)")
         }
 
         var imageData = try Data(contentsOf: sourceURL)
+        
+        // Resize image if too large
         if let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) {
             let originalWidth = cgImage.width
             let originalHeight = cgImage.height
@@ -571,18 +632,21 @@ final class ModelProcessingController {
                     if let resizedImage = context.makeImage(),
                        let resizedData = CGImageDestinationCreateDataWithOptions(image: resizedImage, type: .jpeg, count: 1, options: [kCGImageDestinationLossyCompressionQuality as CFString: 0.8], req: req) {
                         imageData = resizedData
+                        req.logger.debug("Resized image from \(originalWidth)x\(originalHeight) to \(newWidth)x\(newHeight)")
                     }
                 }
             }
         }
 
         guard let destination = CGImageDestinationCreateWithURL(destinationURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
-            throw APIError(message: "Failed to create image destination")
+            throw APIError(message: "Failed to create image destination for \(destinationURL.lastPathComponent)")
         }
 
+        // Prepare metadata
         var metadata = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
         var exifDict = metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
 
+        // Add transform data
         let transformDict: [String: [Float]] = [
             "row0": [transform.columns.0.x, transform.columns.0.y, transform.columns.0.z, transform.columns.0.w],
             "row1": [transform.columns.1.x, transform.columns.1.y, transform.columns.1.z, transform.columns.1.w],
@@ -591,6 +655,7 @@ final class ModelProcessingController {
         ]
         exifDict["CameraTransform"] = transformDict
 
+        // Add ARKit metadata if available
         if let poseJson = poseJson {
             exifDict["ARKitMetadata"] = [
                 "confidence": poseJson["confidence"] as? Double ?? 0.0,
@@ -603,11 +668,13 @@ final class ModelProcessingController {
 
         metadata[kCGImagePropertyExifDictionary as String] = exifDict
 
+        // Save the image with embedded metadata
         if let source = CGImageSourceCreateWithData(imageData as CFData, nil) {
             CGImageDestinationAddImageFromSource(destination, source, 0, metadata as CFDictionary)
             guard CGImageDestinationFinalize(destination) else {
-                throw APIError(message: "Failed to save image with pose data")
+                throw APIError(message: "Failed to save image with embedded pose data")
             }
+            req.logger.debug("Successfully saved image with pose data: \(destinationURL.lastPathComponent)")
         }
     }
 
@@ -622,11 +689,13 @@ final class ModelProcessingController {
             "minFeatureCount": \(minFeatureCount)
         }
         """
-        try metadata.write(to: folder.appendingPathComponent("model.ply.json"), atomically: true, encoding: .utf8)
+        let metadataURL = folder.appendingPathComponent("model.ply.json")
+        try metadata.write(to: metadataURL, atomically: true, encoding: .utf8)
+        req.logger.debug("Created PLY metadata file at \(metadataURL.path)")
     }
 
     private func convertToSIMDMatrix(_ matrix: [[Double]], req: Request) -> simd_float4x4 {
-        simd_float4x4(
+        return simd_float4x4(
             SIMD4<Float>(Float(matrix[0][0]), Float(matrix[0][1]), Float(matrix[0][2]), Float(matrix[0][3])),
             SIMD4<Float>(Float(matrix[1][0]), Float(matrix[1][1]), Float(matrix[1][2]), Float(matrix[1][3])),
             SIMD4<Float>(Float(matrix[2][0]), Float(matrix[2][1]), Float(matrix[2][2]), Float(matrix[2][3])),
@@ -638,9 +707,10 @@ final class ModelProcessingController {
         let fileManager = FileManager.default
         var queue = [folderURL]
         var checkedPaths = Set<URL>()
+        
         req.logger.debug("Searching for images folder in: \(folderURL.path)")
         let rootContents = (try? fileManager.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil).map { $0.lastPathComponent }) ?? []
-        req.logger.debug("ZIP root contents: \(rootContents.joined(separator: ", "))")
+        req.logger.debug("Root contents: \(rootContents.joined(separator: ", "))")
 
         while !queue.isEmpty {
             let currentURL = queue.removeFirst()
@@ -669,12 +739,13 @@ final class ModelProcessingController {
                     return exists
                 }
                 
-                req.logger.debug("Folder \(currentURL.path) has \(imageFiles.count) JPEGs, \(validImageFiles.count) with pose files")
+                req.logger.debug("Folder \(currentURL.path) has \(imageFiles.count) images, \(validImageFiles.count) with valid poses")
                 if validImageFiles.count >= 10 {
-                    req.logger.info("Found valid images folder with \(validImageFiles.count) image-pose pairs: \(currentURL.path)")
+                    req.logger.info("Found valid images folder with \(validImageFiles.count) images: \(currentURL.path)")
                     return currentURL
                 }
                 
+                // Add subdirectories to queue
                 let subdirs = contents.filter { $0.hasDirectoryPath }
                 queue.append(contentsOf: subdirs)
             } catch {
@@ -683,7 +754,7 @@ final class ModelProcessingController {
             }
         }
         
-        req.logger.error("No folder found with ≥10 JPEG images and corresponding pose files")
+        req.logger.error("No folder found with at least 10 valid images and pose files")
         return nil
     }
 
@@ -698,12 +769,14 @@ final class ModelProcessingController {
             let size = attributes[.size] as? Int64 ?? 0
             return size > 1024 ? plyURL : nil
         } catch {
+            req.logger.debug("Could not check PLY file size: \(error)")
             return nil
         }
     }
 
     private func validatePLYFile(_ plyURL: URL, state: inout ProcessingState, req: Request) throws -> Bool {
         do {
+            // Check file size
             let attributes = try FileManager.default.attributesOfItem(atPath: plyURL.path)
             let fileSize = (attributes[.size] as? Int64) ?? 0
             guard fileSize > 1024 else {
@@ -711,6 +784,7 @@ final class ModelProcessingController {
                 return false
             }
             
+            // Read header
             let fileHandle = try FileHandle(forReadingFrom: plyURL)
             defer { fileHandle.closeFile() }
             let headerData = fileHandle.readData(ofLength: 1024)
@@ -720,16 +794,19 @@ final class ModelProcessingController {
                 return false
             }
             
+            // Validate header format
             guard header.lowercased().hasPrefix("ply") else {
-                state.statusMessage = "Invalid PLY file (missing header)"
+                state.statusMessage = "Invalid PLY file format"
                 return false
             }
             
+            // Check for vertex data
             guard header.contains("element vertex") else {
                 state.statusMessage = "PLY file missing vertex data"
                 return false
             }
             
+            // Extract vertex count
             var vertexCount = 0
             if let vertexRange = header.range(of: "element vertex") {
                 let remainingHeader = header[vertexRange.upperBound...]
@@ -739,10 +816,11 @@ final class ModelProcessingController {
             }
             
             guard vertexCount > 1000 else {
-                state.statusMessage = "PLY needs ≥1000 vertices (found: \(vertexCount))"
+                state.statusMessage = "Insufficient vertices (found \(vertexCount), need ≥1000)"
                 return false
             }
             
+            // Check for required properties
             let hasPosition = header.contains("property float x") &&
                              header.contains("property float y") &&
                              header.contains("property float z")
@@ -752,7 +830,7 @@ final class ModelProcessingController {
                             header.contains("property float nz")
             
             if !hasPosition {
-                state.statusMessage = "PLY missing position data"
+                state.statusMessage = "PLY missing position data (x,y,z properties)"
                 return false
             }
             
@@ -762,7 +840,7 @@ final class ModelProcessingController {
             
             return true
         } catch {
-            state.statusMessage = "Error during PLY validation: \(sanitizeError(error: error.localizedDescription))"
+            state.statusMessage = "PLY validation error: \(sanitizeError(error: error.localizedDescription))"
             throw APIError(message: "PLY validation failed: \(error.localizedDescription)")
         }
     }
@@ -775,14 +853,15 @@ final class ModelProcessingController {
                 for item in contents where item.lastPathComponent.contains("photogrammetry_") {
                     try? FileManager.default.removeItem(at: item)
                 }
+                req.logger.info("Cleaned up temporary folders")
             } catch {
-                req.logger.error("Cleanup error: \(error)")
+                req.logger.error("Temporary folder cleanup failed: \(error)")
             }
         }
     }
 
     private func sanitizeError(error: String) -> String {
-        error
+        return error
             .replacingOccurrences(of: "The operation couldn't be completed. ", with: "")
             .replacingOccurrences(of: "(com.apple.photogrammetry ", with: "")
     }
