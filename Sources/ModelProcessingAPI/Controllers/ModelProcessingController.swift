@@ -90,17 +90,21 @@ final class ModelProcessingController {
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent("model_processing_\(UUID().uuidString)")
         let inputDir = tempDir.appendingPathComponent("input")
         let outputDir = tempDir.appendingPathComponent("output")
-        let publicModelsDir = URL(fileURLWithPath: req.application.directory.publicDirectory).appendingPathComponent("models")
+        var publicModelsDir = URL(fileURLWithPath: "/tmp/models")
 
         do {
-            try fileManager.createDirectory(at: inputDir, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: publicModelsDir, withIntermediateDirectories: true)
         } catch {
-            req.logger.error("Failed to create directories: \(error)")
-            let apiError = APIError(message: "Failed to create directories: \(error.localizedDescription)")
-            let data = try JSONEncoder().encode(apiError)
-            return Response(status: .internalServerError, body: .init(data: data))
+            req.logger.error("Failed to create directories at \(publicModelsDir.path): \(error)")
+            // Try fallback location
+            let fallbackDir = URL(fileURLWithPath: "/tmp/models")
+            do {
+                try fileManager.createDirectory(at: fallbackDir, withIntermediateDirectories: true)
+                publicModelsDir = fallbackDir
+            } catch {
+                req.logger.error("Fallback directory creation failed: \(error)")
+                throw error
+            }
         }
         
         let zipURL = inputDir.appendingPathComponent(file.filename.lowercased().hasSuffix(".zip") ? file.filename : "\(file.filename).zip")
