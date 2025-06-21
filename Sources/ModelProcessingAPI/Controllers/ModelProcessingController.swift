@@ -58,7 +58,7 @@ final class ModelProcessingController {
     private let minFeatureCount: Int = 10
     private let maxFileSize: Int = 600_000_000
     private let maxConcurrentTasks: Int = 8
-    private let baseUrl = "http://213.73.97.120:8080"
+    private let baseUrl = "http://213.73.97.120"
     private let retentionPeriod: TimeInterval = 24 * 3600
 
     func processModel(_ req: Request) async throws -> Response {
