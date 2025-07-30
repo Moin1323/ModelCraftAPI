@@ -15,6 +15,7 @@ func routes(_ app: Application) async throws {
     
     // Process model endpoint
     api.post("process") { req async throws -> Response in
+        req.logger.info("Received /api/process request")
         let controller = await ModelProcessingController()
         return try await controller.processModel(req)
     }
