@@ -1,6 +1,14 @@
 import Vapor
 
 func routes(_ app: Application) async throws {
+    
+    
+    api.get("ping") { req async -> String in
+        print("Ping endpoint hit!")
+        return "pong"
+    }
+
+    
     // Basic test routes
     app.get { req async in
         "It works!"
