@@ -208,9 +208,9 @@ final class ModelProcessingController {
 
     private func checkConcurrencyLimit(_ req: Request) throws {
         let activeTasks = req.application.storage[ActiveTasksKey.self] ?? 0
-        guard activeTasks < maxConcurrentTasks else {
-            throw ProcessingError.tooManyConcurrentTasks(max: maxConcurrentTasks)
-        }
+        // guard activeTasks < maxConcurrentTasks else {
+        //     throw ProcessingError.tooManyConcurrentTasks(max: maxConcurrentTasks)
+        // }
         req.application.storage[ActiveTasksKey.self] = activeTasks + 1
         req.logger.info("Incremented active tasks to \(activeTasks + 1)")
     }
