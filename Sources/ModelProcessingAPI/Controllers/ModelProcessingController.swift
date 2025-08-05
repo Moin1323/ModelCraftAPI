@@ -31,6 +31,9 @@ enum ProcessingError: Error, CustomStringConvertible {
     case directoryCreationFailed
     case cleanupFailed
     
+    // Concurrency Errors
+    case tooManyConcurrentTasks(max: Int)
+    
     var description: String {
         switch self {
         case .invalidRequest(let reason):
@@ -66,6 +69,9 @@ enum ProcessingError: Error, CustomStringConvertible {
             return "Could not create required directories"
         case .cleanupFailed:
             return "Temporary files cleanup failed"
+            
+        case .tooManyConcurrentTasks(let max):
+            return "Server busy (processing \(max) models). Please try again shortly"
         }
     }
     
@@ -75,6 +81,8 @@ enum ProcessingError: Error, CustomStringConvertible {
              .insufficientImages, .invalidImageData, .invalidPoseData,
              .invalidPLYFile:
             return .badRequest
+        case .tooManyConcurrentTasks:
+            return .tooManyRequests
         default:
             return .internalServerError
         }
@@ -105,6 +113,8 @@ struct ErrorResponse: Content {
                 return "Try again with different images or check image quality"
             case .fileTooLarge:
                 return "Compress your images or split into smaller batches"
+            case .tooManyConcurrentTasks:
+                return "Wait a few minutes and try your request again"
             default:
                 return nil
             }
@@ -163,37 +173,22 @@ final class ModelProcessingController {
     private let minPoseConfidence: Double = 0.3
     private let minFeatureCount: Int = 10
     private let maxFileSize: Int = 600_000_000
+    private let maxConcurrentTasks: Int = 1000
     private let baseUrl = "http://213.73.97.120"
     private let retentionPeriod: TimeInterval = 24 * 3600
     private let processingTimeout: TimeInterval = 1200 // 20 minutes
 
     func processModel(_ req: Request) async throws -> Response {
-        // Increment active tasks
-        let activeTasks = req.application.storage[ActiveTasksKey.self] ?? 0
-        req.application.storage[ActiveTasksKey.self] = activeTasks + 1
-        req.logger.info("Incremented active tasks to \(activeTasks + 1)")
+        try checkConcurrencyLimit(req)
         
-        do {
-            let file = try await validateAndExtractUpload(req: req)
-            let directories = try createProcessingDirectories(req: req)
-            
-            let response = try await processUploadedFile(
-                file: file,
-                directories: directories,
-                req: req
-            )
-            
-            // Decrement active tasks on successful completion
-            req.application.storage[ActiveTasksKey.self] = (req.application.storage[ActiveTasksKey.self] ?? 1) - 1
-            req.logger.info("Decremented active tasks to \(req.application.storage[ActiveTasksKey.self] ?? 0)")
-            
-            return response
-        } catch {
-            // Ensure active tasks is decremented on any error
-            req.application.storage[ActiveTasksKey.self] = (req.application.storage[ActiveTasksKey.self] ?? 1) - 1
-            req.logger.info("Decremented active tasks to \(req.application.storage[ActiveTasksKey.self] ?? 0) due to error")
-            throw error
-        }
+        let file = try await validateAndExtractUpload(req: req)
+        let directories = try createProcessingDirectories(req: req)
+        
+        return try await processUploadedFile(
+            file: file,
+            directories: directories,
+            req: req
+        )
     }
 
     func getProgress(_ req: Request) async throws -> ProgressResponse {
@@ -210,6 +205,15 @@ final class ModelProcessingController {
     }
 
     // MARK: - Private Implementation
+
+    private func checkConcurrencyLimit(_ req: Request) throws {
+        let activeTasks = req.application.storage[ActiveTasksKey.self] ?? 0
+        guard activeTasks < maxConcurrentTasks else {
+            throw ProcessingError.tooManyConcurrentTasks(max: maxConcurrentTasks)
+        }
+        req.application.storage[ActiveTasksKey.self] = activeTasks + 1
+        req.logger.info("Incremented active tasks to \(activeTasks + 1)")
+    }
 
     private func validateAndExtractUpload(req: Request) async throws -> File {
         let file: File
@@ -256,54 +260,66 @@ final class ModelProcessingController {
         }
     }
 
-    private func processUploadedFile(
-        file: File,
-        directories: (input: URL, output: URL),
-        req: Request
-    ) async throws -> Response {
-        let zipURL = directories.input.appendingPathComponent(file.filename)
-        
-        do {
-            try await req.fileio.writeFile(file.data, at: zipURL.path)
-            req.logger.debug("Saved uploaded file to \(zipURL.path)")
-            
-            try extractZip(zipURL, to: directories.input, req: req)
-            
-            let (inputFolder, imagesFolder) = try prepareInputFolder(at: directories.input, req: req)
-            let outputFile = directories.output.appendingPathComponent("model.usdz")
-            
-            let initialState = ProcessingState(
-                inputFolder: inputFolder,
-                outputFile: outputFile,
-                status: "Starting processing",
-                isProcessing: true
-            )
-            await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: initialState)
-            
-            let response = try await startPhotogrammetryProcessing(
-                input: imagesFolder,
-                output: outputFile,
-                req: req
-            )
-            
-            scheduleCleanup(directory: directories.input, req: req)
-            
-            let data = try JSONEncoder().encode(response)
-            return Response(status: .ok, body: .init(data: data))
-            
-        } catch let error as ProcessingError {
-            try await cleanupOnFailure(directory: directories.input, req: req)
-            return try handleProcessingError(error, req: req)
-            
-        } catch {
-            req.logger.error("Unexpected processing error: \(error)")
-            try await cleanupOnFailure(directory: directories.input, req: req)
-            return try handleProcessingError(
-                .processingFailed(reason: error.localizedDescription),
-                req: req
-            )
+private func processUploadedFile(
+    file: File,
+    directories: (input: URL, output: URL),
+    req: Request
+) async throws -> Response {
+    let zipURL = directories.input.appendingPathComponent(file.filename)
+
+    // ✅ defer block for cleanup and active task decrement
+    defer {
+        Task {
+            do {
+                try await cleanupOnFailure(directory: directories.input, req: req)
+            } catch {
+                req.logger.error("Cleanup after processing failed: \(error.localizedDescription)")
+            }
+            let current = req.application.storage[ActiveTasksKey.self] ?? 1
+            req.application.storage[ActiveTasksKey.self] = max(current - 1, 0)
+            req.logger.info("Decremented active tasks to \(req.application.storage[ActiveTasksKey.self] ?? 0)")
         }
     }
+
+    do {
+        try await req.fileio.writeFile(file.data, at: zipURL.path)
+        req.logger.debug("Saved uploaded file to \(zipURL.path)")
+
+        try extractZip(zipURL, to: directories.input, req: req)
+
+        let (inputFolder, imagesFolder) = try prepareInputFolder(at: directories.input, req: req)
+        let outputFile = directories.output.appendingPathComponent("model.usdz")
+
+        let initialState = ProcessingState(
+            inputFolder: inputFolder,
+            outputFile: outputFile,
+            status: "Starting processing",
+            isProcessing: true
+        )
+        await req.storage.setWithAsyncShutdown(ProcessingStateKey.self, to: initialState)
+
+        let response = try await startPhotogrammetryProcessing(
+            input: imagesFolder,
+            output: outputFile,
+            req: req
+        )
+
+        scheduleCleanup(directory: directories.input, req: req)
+
+        let data = try JSONEncoder().encode(response)
+        return Response(status: .ok, body: .init(data: data))
+
+    } catch let error as ProcessingError {
+        return try handleProcessingError(error, req: req)
+    } catch {
+        req.logger.error("Unexpected processing error: \(error)")
+        return try handleProcessingError(
+            .processingFailed(reason: error.localizedDescription),
+            req: req
+        )
+    }
+}
+
 
     // MARK: - Photogrammetry Processing
 
